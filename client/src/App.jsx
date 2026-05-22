@@ -585,6 +585,10 @@ export default function App() {
                     <span className="tag">{(recipe.ingredients || []).length} ingredients</span>
                     <span className="tag">{(recipe.directions || []).length} steps</span>
                     {imageUrl && <span className="tag">📸 photo</span>}
+                    {recipe.transcriptUsed
+                      ? <span className="tag" style={{color:"#4ade80",borderColor:"rgba(74,222,128,0.3)",background:"rgba(74,222,128,0.08)"}}>✓ from transcript</span>
+                      : <span className="tag" style={{color:"#facc15",borderColor:"rgba(250,204,21,0.3)",background:"rgba(250,204,21,0.08)"}}>⚠ web search used</span>
+                    }
                   </div>
                 </div>
               </div>
