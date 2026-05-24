@@ -12,42 +12,60 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "../client/dist")));
 
-// ── Fetch transcript from YouTube ─────────────────────────────────────────
-async function getTranscript(videoId) {
+// ── YouTube: fetch description + title via Data API ───────────────────────
+async function getVideoDescription(videoId) {
+  const key = process.env.YOUTUBE_API_KEY;
+  if (!key) return null;
   try {
-    const lines = await YoutubeTranscript.fetchTranscript(videoId);
-    // Join all caption lines into one block of text
-    return lines.map(l => l.text).join(" ");
-  } catch (e) {
-    return null;
-  }
-}
-
-// ── Fetch video title + description via oembed (no API key needed) ─────────
-async function getVideoMeta(videoId) {
-  try {
-    const url = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
+    const url = `https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${videoId}&key=${key}`;
     const resp = await fetch(url);
     if (!resp.ok) return null;
     const data = await resp.json();
-    return { title: data.title, author: data.author_name };
+    const snippet = data.items?.[0]?.snippet;
+    if (!snippet) return null;
+    return {
+      title: snippet.title,
+      description: snippet.description,
+      channelTitle: snippet.channelTitle,
+    };
   } catch {
     return null;
   }
 }
 
-// ── Call Anthropic API ────────────────────────────────────────────────────
+// ── YouTube: fetch transcript/captions ───────────────────────────────────
+async function getTranscript(videoId) {
+  try {
+    const lines = await YoutubeTranscript.fetchTranscript(videoId);
+    return lines.map(l => l.text).join(" ");
+  } catch {
+    return null;
+  }
+}
+
+// ── YouTube: oembed fallback for title when no API key ───────────────────
+async function getOembed(videoId) {
+  try {
+    const resp = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return { title: data.title, channelTitle: data.author_name };
+  } catch {
+    return null;
+  }
+}
+
+// ── Call Anthropic ────────────────────────────────────────────────────────
 async function callClaude(system, userMessage, useWebSearch = false) {
   const body = {
     model: "claude-sonnet-4-20250514",
-    max_tokens: 1000,
+    max_tokens: 2000,
     system,
     messages: [{ role: "user", content: userMessage }],
   };
   if (useWebSearch) {
     body.tools = [{ type: "web_search_20250305", name: "web_search" }];
   }
-
   const resp = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -57,11 +75,7 @@ async function callClaude(system, userMessage, useWebSearch = false) {
     },
     body: JSON.stringify(body),
   });
-
-  if (!resp.ok) {
-    const err = await resp.text();
-    throw new Error(`Anthropic API error ${resp.status}: ${err}`);
-  }
+  if (!resp.ok) throw new Error(`Anthropic API error ${resp.status}: ${await resp.text()}`);
   return resp.json();
 }
 
@@ -70,89 +84,93 @@ function extractJSON(data) {
   for (const block of [...data.content].reverse()) {
     if (block.type === "text") {
       const text = block.text.trim();
-      if (text.startsWith("{")) {
-        try { return JSON.parse(text); } catch {}
-      }
+      if (text.startsWith("{")) { try { return JSON.parse(text); } catch {} }
       const match = text.match(/\{[\s\S]*\}/);
-      if (match) {
-        try { return JSON.parse(match[0]); } catch {}
-      }
+      if (match) { try { return JSON.parse(match[0]); } catch {} }
     }
   }
   return null;
 }
 
-// ── POST /api/extract ──────────────────────────────────────────────────────
+// ── POST /api/extract ─────────────────────────────────────────────────────
 app.post("/api/extract", async (req, res) => {
   const { videoId } = req.body;
   if (!videoId) return res.status(400).json({ error: "Missing videoId" });
 
   try {
-    // Fetch transcript and video meta in parallel
-    const [transcript, meta] = await Promise.all([
-      getTranscript(videoId),
-      getVideoMeta(videoId),
-    ]);
-
-    const hasTranscript = transcript && transcript.length > 100;
     const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-    let userMessage;
-    let useWebSearch = false;
+    // Gather all available sources in parallel
+    const [meta, transcript] = await Promise.all([
+      getVideoDescription(videoId).then(d => d || getOembed(videoId)),
+      getTranscript(videoId),
+    ]);
 
-    if (hasTranscript) {
-      // Best case: we have the actual spoken content of the video
-      userMessage = `Extract the recipe from this YouTube video.
+    const hasDescription = meta?.description && meta.description.length > 80;
+    const hasTranscript = transcript && transcript.length > 100;
+    const hasYouTubeAPI = !!process.env.YOUTUBE_API_KEY;
 
-Video title: ${meta?.title || "Unknown"}
-Creator: ${meta?.author || "Unknown"}
-Video URL: ${videoUrl}
+    // Build the richest possible context for Claude
+    let contextBlocks = [];
+    let sources = [];
 
-Video transcript (what the creator says in the video):
-"""
-${transcript.slice(0, 4000)}
-"""
+    if (meta?.title) contextBlocks.push(`Video title: ${meta.title}`);
+    if (meta?.channelTitle) contextBlocks.push(`Creator: ${meta.channelTitle}`);
+    contextBlocks.push(`Video URL: ${videoUrl}`);
 
-Use the transcript as your primary source. Extract all ingredients with measurements and step-by-step directions exactly as described. Return only the JSON object.`;
-    } else {
-      // Fallback: no transcript, use web search
-      useWebSearch = true;
-      userMessage = `Extract the recipe from this YouTube video. No transcript was available, so search the web for the recipe.
-
-Video title: ${meta?.title || "Unknown"}
-Creator: ${meta?.author || "Unknown"}
-Video URL: ${videoUrl}
-
-Search for the recipe online — check the creator's website, blog, or social media. Return only the JSON object.`;
+    if (hasDescription) {
+      contextBlocks.push(`\nVideo description (written by the creator):\n"""\n${meta.description.slice(0, 3000)}\n"""`);
+      sources.push("description");
     }
 
-    const system = `You are a recipe extraction assistant. Extract recipe details and return ONLY a valid JSON object with no markdown, no backticks, no extra text:
+    if (hasTranscript) {
+      contextBlocks.push(`\nVideo transcript (spoken audio):\n"""\n${transcript.slice(0, 3000)}\n"""`);
+      sources.push("transcript");
+    }
+
+    // Decide whether to also use web search
+    // Use it if we have neither description nor transcript, or as supplemental
+    const useSearch = !hasDescription && !hasTranscript;
+
+    const sourceLabel = sources.length > 0
+      ? sources.join(" + ")
+      : hasYouTubeAPI ? "web search (no description found)" : "web search (no API key)";
+
+    const system = `You are a precise recipe extraction assistant. Extract recipes with exact measurements, temperatures, and techniques.
+
+Return ONLY a valid JSON object, no markdown, no backticks:
 {
   "name": "Recipe Name",
-  "description": "Brief 1-2 sentence description of the dish",
+  "description": "1-2 sentence description of the finished dish",
   "servings": "4",
   "prepTime": 15,
   "cookTime": 30,
-  "ingredients": ["1 cup flour", "2 large eggs", "..."],
-  "directions": ["Preheat oven to 375°F.", "Mix the flour and eggs.", "..."],
-  "searchQuery": "recipe name finished dish food photography",
-  "transcriptUsed": true
+  "ingredients": ["1 cup all-purpose flour", "2 large eggs", "..."],
+  "directions": ["Preheat oven to 375°F (190°C).", "In a large bowl, whisk together...", "..."],
+  "searchQuery": "finished dish name food photography",
+  "sourceLabel": "${sourceLabel}"
 }
 
-prepTime and cookTime are integers in minutes (0 if unknown).
-transcriptUsed should be true if you had a transcript, false if you used web search.
-searchQuery should produce a beautiful food photo of the finished dish.
-Be precise with measurements, temperatures, and cooking methods — exactly as stated in the source.`;
+Rules:
+- ingredients: always include quantity and unit (e.g. "2 tablespoons olive oil", not just "olive oil")
+- directions: each step is a complete, precise sentence. Include temperatures, times, and visual cues.
+- If you're unsure of a measurement, note it as "to taste" or give a typical range
+- Do NOT invent steps or ingredients not present in the source material
+- prepTime and cookTime are integers in minutes`;
 
-    const data = await callClaude(system, userMessage, useWebSearch);
+    const userMessage = contextBlocks.join("\n") + "\n\nExtract the complete recipe. Return only the JSON.";
+
+    const data = await callClaude(system, userMessage, useSearch);
     const recipe = extractJSON(data);
 
     if (!recipe) {
-      return res.status(422).json({ error: "Could not parse a recipe from this video. The video may not have captions and the recipe may not be posted online." });
+      return res.status(422).json({
+        error: "Could not extract a recipe from this video. Try a video where the creator posts the recipe in the description."
+      });
     }
 
-    // Tell the frontend whether we used transcript or search
-    recipe.transcriptUsed = hasTranscript;
+    recipe.sourceLabel = sourceLabel;
+    recipe.hasYouTubeAPI = hasYouTubeAPI;
     res.json(recipe);
 
   } catch (err) {
@@ -161,33 +179,26 @@ Be precise with measurements, temperatures, and cooking methods — exactly as s
   }
 });
 
-// ── POST /api/photo ────────────────────────────────────────────────────────
+// ── POST /api/photo ───────────────────────────────────────────────────────
 app.post("/api/photo", async (req, res) => {
   const { query } = req.body;
   if (!query) return res.status(400).json({ error: "Missing query" });
-
   try {
     const data = await callClaude(
-      `You find recipe photos. Search for a beautiful food photo and return ONLY a JSON object (no markdown):
-{"imageUrl": "https://example.com/photo.jpg"}
-Find a direct image URL (.jpg, .jpeg, .png, .webp). If you cannot find one, return {"imageUrl": ""}.`,
+      `Find a recipe photo. Search and return ONLY JSON (no markdown): {"imageUrl": "https://...jpg"}. Direct image URL only. If not found: {"imageUrl": ""}`,
       `Find a beautiful food photo for: ${query}`,
       true
     );
-
     const result = extractJSON(data);
     res.json({ imageUrl: result?.imageUrl || "" });
-  } catch (err) {
-    console.error("Photo error:", err.message);
+  } catch {
     res.json({ imageUrl: "" });
   }
 });
 
-// ── Catch-all → React app ──────────────────────────────────────────────────
+// ── Catch-all ─────────────────────────────────────────────────────────────
 app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "../client/dist/index.html"));
 });
 
-app.listen(PORT, () => {
-  console.log(`✅  YT-to-Paprika running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`✅  YT-to-Paprika running on port ${PORT}`));
